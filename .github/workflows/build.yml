@@ -1,0 +1,163 @@
+# Standalone GitHub Actions workflow: build rz-ghidra v0.9.0 (Ghidra 12.1) against Rizin on Ubuntu 24.04.
+#
+# Save as: .github/workflows/rz-ghidra-build.yml in your fork of rz-ghidra
+#          (or in any repo; by default it checks out rizinorg/rz-ghidra@v0.9.0).
+# Triggers: pushes, pull requests, manual dispatch, and version tags.
+#
+# What it does:
+#   1. Checks out rz-ghidra v0.9.0 with recursive submodules (Ghidra + deps).
+#   2. Adds the official Rizin OBS apt repo for xUbuntu_24.04 and installs
+#      Rizin + build tools (cmake, ninja, g++, ccache).
+#   3. Configures with CMake + Ninja (Release) into a staging prefix.
+#   4. Builds, installs, packages (.so + sleigh data/specs), uploads artifact.
+
+name: Build rz-ghidra v0.9.0 (Ghidra 12.1) — Ubuntu 24.04
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref (keeps CI fast and cheap).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RZ_GHIDRA_REF: v0.9.0
+  GHIDRA_VERSION: "12.1"
+  CMAKE_BUILD_TYPE: Release
+  INSTALL_PREFIX: ${{ github.workspace }}/install_prefix
+  PACKAGE_NAME: rz-ghidra-v0.9.0-ubuntu-24.04
+
+jobs:
+  build:
+    name: Build on Ubuntu 24.04
+    runs-on: ubuntu-24.04
+
+    steps:
+      # ------------------------------------------------------------------
+      # 1. Checkout rz-ghidra with all submodules (Ghidra, sleigh, etc.).
+      #    Explicitly points to upstream rizinorg/rz-ghidra so this workflow
+      #    can run in ANY repo or fork.
+      # ------------------------------------------------------------------
+      - name: Checkout rz-ghidra
+        uses: actions/checkout@v4
+        with:
+          repository: rizinorg/rz-ghidra
+          ref: v0.9.0
+          submodules: recursive
+          fetch-depth: 0
+
+      # ------------------------------------------------------------------
+      # 2a. Add the official Rizin OBS apt repository for xUbuntu_24.04.
+      #     See https://rizin.re/ and https://build.opensuse.org/project/show/home:RizinOrg
+      # ------------------------------------------------------------------
+      - name: Add Rizin OBS apt repository
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo 'deb http://download.opensuse.org/repositories/home:/RizinOrg/xUbuntu_24.04/ /' | \
+            sudo tee /etc/apt/sources.list.d/home:RizinOrg.list
+          curl -fsSL https://download.opensuse.org/repositories/home:/RizinOrg/xUbuntu_24.04/Release.key | \
+            gpg --dearmor | \
+            sudo tee /etc/apt/trusted.gpg.d/home_RizinOrg.gpg > /dev/null
+          sudo apt-get update
+
+      # ------------------------------------------------------------------
+      # 2b. Install Rizin + native build toolchain.
+      #     The -dev package name has varied over time (rizin-dev vs
+      #     librz-dev vs headers bundled in `rizin`), so try the known
+      #     names best-effort instead of hard-failing.
+      # ------------------------------------------------------------------
+      - name: Install dependencies (Rizin + CMake/Ninja toolchain)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get install -y \
+            cmake \
+            ninja-build \
+            g++ \
+            ccache \
+            pkg-config \
+            zlib1g-dev \
+            curl \
+            gnupg
+          sudo apt-get install -y rizin
+          sudo apt-get install -y rizin-dev || sudo apt-get install -y librz-dev || true
+
+      # ------------------------------------------------------------------
+      # 2c. Sanity-check the Rizin install before building.
+      # ------------------------------------------------------------------
+      - name: Verify Rizin installation
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rizin -v
+          rz-ax -v || true
+          pkg-config --modversion rz_core rz_io rz_bin rz_arch rz_il 2>/dev/null || pkg-config --list-all | grep -i '^rz_' || true
+
+      # ------------------------------------------------------------------
+      # 3. Configure with CMake + Ninja in Release mode.
+      #    Explicitly redirect RIZIN_INSTALL_PLUGDIR into our staging prefix,
+      #    otherwise CMake defaults to system /usr/lib/... and fails without root.
+      # ------------------------------------------------------------------
+      - name: Configure (CMake + Ninja, Release)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            "-DCMAKE_INSTALL_PREFIX=${GITHUB_WORKSPACE}/install_prefix" \
+            "-DRIZIN_INSTALL_PLUGDIR=${GITHUB_WORKSPACE}/install_prefix/lib/rizin/plugins" \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      # ------------------------------------------------------------------
+      # 4. Build and install to the staging prefix.
+      # ------------------------------------------------------------------
+      - name: Build
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake --build build --config Release --parallel
+          ccache --show-stats || true
+
+      - name: Install to staging prefix
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake --install build --config Release
+          echo "=== Staged files ==="
+          find "${GITHUB_WORKSPACE}/install_prefix" -type f | sort
+
+      # ------------------------------------------------------------------
+      # 5a. Package the installed plugin (.so files + sleigh data/specs).
+      # ------------------------------------------------------------------
+      - name: Package plugin
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "${GITHUB_WORKSPACE}"
+          echo "=== Shared objects ==="
+          find install_prefix -type f -name '*.so*' | sort || true
+          echo "=== Sleigh data/specs ==="
+          find install_prefix -type f \( -iname '*.sinc' -o -iname '*.pspec' -o -iname '*.cspec' -o -iname '*.ldefs' -o -path '*sleigh*' \) | sort || true
+          tar -czf "${PACKAGE_NAME}.tar.gz" -C install_prefix .
+          ls -lh "${PACKAGE_NAME}.tar.gz"
+          tar -tzf "${PACKAGE_NAME}.tar.gz" | sort | head -n 100
+
+      # ------------------------------------------------------------------
+      # 5b. Upload the packaged plugin as a workflow artifact.
+      # ------------------------------------------------------------------
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rz-ghidra-v0.9.0-ubuntu-24.04
+          path: |
+            ${{ github.workspace }}/rz-ghidra-v0.9.0-ubuntu-24.04.tar.gz
+            ${{ github.workspace }}/install_prefix/
+          if-no-files-found: error
+          retention-days: 30
