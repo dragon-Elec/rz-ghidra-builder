@@ -52,41 +52,32 @@ jobs:
           fetch-depth: 0
 
       # ------------------------------------------------------------------
-      # 2a. Add the official Rizin OBS apt repository for xUbuntu_24.04.
-      #     See https://rizin.re/ and https://build.opensuse.org/project/show/home:RizinOrg
+      # 2. Install build dependencies + build & install Rizin v0.9.1.
+      #    Rizin's meson build installs RizinConfig.cmake, librz, and headers.
       # ------------------------------------------------------------------
-      - name: Add Rizin OBS apt repository
+      - name: Install build toolchain
         shell: bash
         run: |
           set -euxo pipefail
-          echo 'deb http://download.opensuse.org/repositories/home:/RizinOrg/xUbuntu_24.04/ /' | \
-            sudo tee /etc/apt/sources.list.d/home:RizinOrg.list
-          curl -fsSL https://download.opensuse.org/repositories/home:/RizinOrg/xUbuntu_24.04/Release.key | \
-            gpg --dearmor | \
-            sudo tee /etc/apt/trusted.gpg.d/home_RizinOrg.gpg > /dev/null
           sudo apt-get update
-
-      # ------------------------------------------------------------------
-      # 2b. Install Rizin + native build toolchain.
-      #     The -dev package name has varied over time (rizin-dev vs
-      #     librz-dev vs headers bundled in `rizin`), so try the known
-      #     names best-effort instead of hard-failing.
-      # ------------------------------------------------------------------
-      - name: Install dependencies (Rizin + CMake/Ninja toolchain)
-        shell: bash
-        run: |
-          set -euxo pipefail
           sudo apt-get install -y \
             cmake \
             ninja-build \
+            meson \
             g++ \
             ccache \
             pkg-config \
-            zlib1g-dev \
-            curl \
-            gnupg
-          sudo apt-get install -y rizin
-          sudo apt-get install -y rizin-dev || sudo apt-get install -y librz-dev || true
+            zlib1g-dev
+
+      - name: Build & install Rizin v0.9.1
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch v0.9.1 https://github.com/rizinorg/rizin /tmp/rizin
+          cd /tmp/rizin
+          meson setup build --prefix=/usr -Dbuildtype=release -Duse_sys_zlib=enabled
+          ninja -C build
+          sudo ninja -C build install
 
       # ------------------------------------------------------------------
       # 2c. Sanity-check the Rizin install before building.
